@@ -214,38 +214,49 @@ export function snapshot(studyId?: string) {
 
 export function listAudits(eventId: string): EventAudit[] { return auditEntries.filter((item) => item.eventId === eventId).map(clone); }
 export function listTimeline(eventId: string) { return eventTimeline.filter((item) => item.eventId === eventId).map(clone); }
-export function listOutbox(studyId?: string) { const eventIds = new Set(scope(adverseEvents, studyId).map((item) => item.id)); return outboxMessages.filter((item) => !studyId || (item.aggregateType === 'ADVERSE_EVENT' ? eventIds.has(item.aggregateId) : exports.some((job) => job.id === item.aggregateId && job.studyId === studyId))).map(clone); }
+export function listOutbox(studyId?: string) {
+  if (!studyId) return outboxMessages.map(clone);
+  return outboxMessages.filter((message) => {
+    if (message.aggregateType === 'ADVERSE_EVENT') return adverseEvents.some((event) => event.id === message.aggregateId && event.studyId === studyId);
+    if (message.aggregateType === 'EXPORT_JOB') return exports.some((job) => job.id === message.aggregateId && job.studyId === studyId);
+    return dataBatches.some((batch) => batch.id === message.aggregateId && batch.studyId === studyId);
+  }).map(clone);
+}
 export function listReviewTasks(studyId?: string): ReviewTask[] { return scope(reviewTasks, studyId).map(clone); }
 export function listQualityFindings(studyId?: string): QualityFinding[] { return scope(qualityFindings, studyId).map(clone); }
 export function listSignals(studyId?: string) { return signalDefinitions.filter((item) => item.enabled && (!studyId || item.studyId === studyId)).map((definition) => ({ definition: clone(definition), result: signalFor(definition.studyId, definition) })); }
 
 export function ingestBatch(input: Pick<DataBatch, 'studyId' | 'siteId' | 'source' | 'sourceBatchId' | 'effectiveAt' | 'rowCount' | 'checksum'>) {
   studyFor(input.studyId);
-  const existing = dataBatches.find((batch) => batch.sourceBatchId === input.sourceBatchId);
-  if (existing) {
-    existing.status = input.source === 'LAB' ? 'ACCEPTED' : existing.status;
-    existing.acceptedRows += input.rowCount;
-    existing.rejectedRows = Math.max(0, existing.rowCount - existing.acceptedRows);
-    appendOutbox(existing.id, 'DATA_BATCH', 'DATA_BATCH_REPLAYED', 1, { batch: clone(existing) });
-    return clone(existing);
-  }
-  if (!sites.some((item) => item.id === input.siteId)) {
+  // sourceBatchId is only unique within one study + source system tuple; the
+  // same number from another study or another source must land in its own batch.
+  const existing = dataBatches.find((batch) => batch.studyId === input.studyId && batch.source === input.source && batch.sourceBatchId === input.sourceBatchId);
+  // A redelivery must return the original batch exactly as it was accepted:
+  // never touch status, counters, receivedAt or checksum, never re-run rules,
+  // and never append another quality finding or outbox event.
+  if (existing) return clone(existing);
+
+  const site = sites.find((item) => item.id === input.siteId);
+  if (!site) {
     throw new DomainConflictError('site is not registered', { siteId: input.siteId });
   }
+  if (site.studyId !== input.studyId) {
+    throw new DomainConflictError('site does not belong to study', { siteId: input.siteId, studyId: input.studyId, siteStudyId: site.studyId });
+  }
+
+  // Large laboratory feeds need manual validation before any row is taken.
+  const quarantine = input.source === 'LAB' && input.rowCount > 1000;
+  const timestamp = now();
   const batch: DataBatch = {
     ...input,
     id: `batch-${randomUUID().slice(0, 8)}`,
-    receivedAt: now(),
-    status: 'VALIDATING',
-    acceptedRows: 0,
+    receivedAt: timestamp,
+    status: quarantine ? 'QUARANTINED' : 'ACCEPTED',
+    acceptedRows: quarantine ? 0 : input.rowCount,
     rejectedRows: 0,
   };
   dataBatches.unshift(batch);
-  const blocker = input.rowCount > 1000 && input.source === 'LAB';
-  batch.status = 'ACCEPTED';
-  batch.acceptedRows = input.rowCount;
-  batch.rejectedRows = 0;
-  if (blocker) {
+  if (quarantine) {
     qualityFindings.unshift({
       id: `finding-${randomUUID().slice(0, 8)}`,
       studyId: input.studyId,
@@ -254,7 +265,7 @@ export function ingestBatch(input: Pick<DataBatch, 'studyId' | 'siteId' | 'sourc
       severity: 'BLOCKER',
       message: 'Large laboratory batch requires validation review.',
       status: 'OPEN',
-      createdAt: now(),
+      createdAt: timestamp,
     });
   }
   appendOutbox(batch.id, 'DATA_BATCH', 'DATA_BATCH_INGESTED', 1, { batch: clone(batch) });
